@@ -95,6 +95,37 @@ def bad(t):
     return paint(t, "1;" + RED)
 
 
+class Spinner:
+    """`with Spinner("Reading…"):` shows a turning Dash0-red dot and the seconds waited (terminals only)."""
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, text):
+        self.text, self.done = text, threading.Event()
+
+    def _run(self):
+        start, i = time.time(), 0
+        while not self.done.wait(0.1):
+            sys.stdout.write(f"\r  {brand(self.FRAMES[i % len(self.FRAMES)])} {self.text} {dim(f'{time.time() - start:.0f}s')}\033[K")
+            sys.stdout.flush()
+            i += 1
+
+    def __enter__(self):
+        self.live = sys.stdout.isatty()
+        if self.live:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        else:
+            say(f"  {self.text}")
+        return self
+
+    def __exit__(self, *exc):
+        if self.live:
+            self.done.set()
+            self.thread.join()
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+
 def plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "s")
 
@@ -127,6 +158,8 @@ def request(method, url, body=None, form=None, headers=None, timeout=120):
         return e.code, e.headers, e.read().decode("utf-8", "replace")
     except urllib.error.URLError as e:
         raise Fail(f"Could not reach {urllib.parse.urlsplit(url).netloc}: {e.reason}")
+    except (TimeoutError, socket.timeout):
+        raise Fail(f"{urllib.parse.urlsplit(url).netloc} did not answer within {timeout} seconds. Try again in a moment.")
 
 
 def error_text(status, text):
@@ -340,6 +373,12 @@ class DatadogMCP:
         meta = f"https://mcp.{site}/.well-known/oauth-authorization-server/v1/mcp"
         self.oauth = OAuth(f"Datadog ({site})", meta, "mcp_all", resource=self.url)
         self.session, self.next_id = None, 0
+        self.lock = threading.Lock()  # one request at a time per session id update
+        self.oauth.token()  # browser login first (if needed), outside the spinner
+        with Spinner("Connecting to Datadog…"):
+            self._initialize()
+
+    def _initialize(self):
         self._send("initialize", {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
@@ -350,15 +389,18 @@ class DatadogMCP:
     def _send(self, method, params, notify=False):
         msg = {"jsonrpc": "2.0", "method": method, "params": params}
         if not notify:
-            self.next_id += 1
-            msg["id"] = self.next_id
+            with self.lock:  # the two readers run in parallel: unique request ids
+                self.next_id += 1
+                msg["id"] = self.next_id
         for attempt in (1, 2):
+            with self.lock:  # at most one token refresh or login at a time
+                token = self.oauth.token()
             h = {"Accept": "application/json, text/event-stream",
-                 "Authorization": "Bearer " + self.oauth.token()}
+                 "Authorization": "Bearer " + token}
             if self.session:
                 h["Mcp-Session-Id"] = self.session
                 h["MCP-Protocol-Version"] = "2025-06-18"
-            status, headers, text = request("POST", self.url, body=msg, headers=h, timeout=180)
+            status, headers, text = request("POST", self.url, body=msg, headers=h, timeout=60)
             if status == 401 and attempt == 1:
                 self.oauth.expire()
                 continue
@@ -593,9 +635,24 @@ def migrate(args):
                                   args.datadog_site, "--datadog-site")
     step("Datadog", site_label)
     datadog = DatadogMCP(site)
-    say("  Reading your dashboards and monitors…")
-    dashboards = datadog.dashboards()
-    mons = datadog.monitors()
+    found, errors = {}, []
+
+    def read(kind, fn):
+        try:
+            found[kind] = fn()
+        except Exception as e:  # reported below, after both reads finished
+            errors.append(e)
+
+    with Spinner("Reading your dashboards and monitors…"):
+        readers = [threading.Thread(target=read, args=("dashboards", datadog.dashboards)),
+                   threading.Thread(target=read, args=("monitors", datadog.monitors))]
+        for t in readers:
+            t.start()
+        for t in readers:
+            t.join()
+    if errors:
+        raise errors[0] if isinstance(errors[0], Fail) else Fail(f"Datadog: {errors[0]}")
+    dashboards, mons = found["dashboards"], found["monitors"]
     say(f"  Found {plural(len(dashboards), 'dashboard')} and {plural(len(mons), 'monitor')}.")
     if not dashboards and not mons:
         raise Fail("Nothing to migrate in this Datadog account.")
@@ -625,10 +682,10 @@ def migrate(args):
     report_lines, perses_list = [], []
     for d in chosen_dash:
         title = d.get("dashboard_title") or d["dashboard_id"]
-        say(dim(f"  translating {title}…"))
         try:
-            source = datadog.dashboard(d["dashboard_id"])
-            perses, rep = dd.convert(source)
+            with Spinner(f"Translating {title}…"):
+                source = datadog.dashboard(d["dashboard_id"])
+                perses, rep = dd.convert(source)
         except (Exception, SystemExit) as e:  # one bad dashboard must not stop the others
             report_lines.append(("dashboard", title, "FAIL", [f"not translated: {e}"]))
             continue
@@ -688,7 +745,8 @@ def migrate(args):
                                    args.dash0_region, "--dash0-region")
     step("Dash0", region_label)
     dash0 = Dash0(api)
-    sets = dash0.datasets()
+    with Spinner("Reading your Dash0 datasets…"):
+        sets = dash0.datasets()
     if not sets:
         raise Fail("Dash0: this login sees no datasets.")
     ds_label, dataset = choose_one("Which dataset should the dashboards and alerts go to?",
@@ -705,8 +763,9 @@ def migrate(args):
         body = {"kind": "Dashboard", "metadata": {"name": perses["metadata"]["name"],
                                                   "dash0Extensions": perses["metadata"]["dash0Extensions"]},
                 "spec": perses["spec"]}
-        status, text = dash0.call("POST", "/api/import/dashboard" + q, body)
         title = perses["spec"].get("display", {}).get("name", perses["metadata"]["name"])
+        with Spinner(f"Importing {title}…"):
+            status, text = dash0.call("POST", "/api/import/dashboard" + q, body)
         if status in (200, 201):
             say(good(f"  ✓ dashboard {title}"))
         else:
@@ -714,7 +773,7 @@ def migrate(args):
             say(bad(f"  ✗ dashboard {title}: {error_text(status, text)}"))
     # Alerts from an earlier run are updated in place; the import endpoint only creates.
     new_items = []
-    for item in items:
+    for item in items:  # quick checks; the spinner below covers the bulk import
         path = f"/api/alerting/check-rules/{item['id']}{q}"
         if dash0.call("GET", path)[0] != 200:
             new_items.append(item)
@@ -726,7 +785,8 @@ def migrate(args):
             ok = False
             say(bad(f"  ✗ alert {item['name']}: {error_text(status, text)}"))
     if new_items:
-        status, text = dash0.call("POST", "/api/import/check-rules" + q, {"items": new_items})
+        with Spinner(f"Importing {plural(len(new_items), 'alert')}…"):
+            status, text = dash0.call("POST", "/api/import/check-rules" + q, {"items": new_items})
         if status in (200, 201):
             say(good(f"  ✓ {plural(len(new_items), 'alert')} created"))
         else:
